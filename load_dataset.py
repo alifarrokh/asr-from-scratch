@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import torchaudio
+from datasets import Dataset
 
 
 # Special chars
@@ -11,6 +13,7 @@ CHAR_UNK = '[UNK]'
 # Dataset address
 DS_ROOT = 'dataset'
 WAVS_DIR = f'{DS_ROOT}/wav'
+DS_SR = 22050
 
 
 def read_lines(file_path):
@@ -56,7 +59,7 @@ def load_split(split_name):
     labels = {l[:14] : l[15:] for l in tlines}
 
     data = {k: {
-        'label': preprocess_text(labels[k]),
+        'sentence': preprocess_text(labels[k]),
         'segment': segments[k],
         'wav_path': os.path.join(WAVS_DIR, f'{k[:5]}.wav')
     } for k in labels.keys()}
@@ -84,6 +87,30 @@ def generate_vocab(with_special_tokens=True):
     # Save the vocab
     with open('vocab.json', 'w') as vocab_file:
         json.dump(vocab_dict, vocab_file)
+
+
+def __load_item(item, sampling_rate):
+    waveform, orig_sr = torchaudio.load(item['wav_path'])
+
+    # Extract the audio segment
+    start_second, end_second = item['segment']
+    start_sample, end_sample = round(orig_sr * start_second), round(orig_sr * end_second) 
+    waveform = waveform[:, start_sample:end_sample]
+
+    # Resample if required
+    if orig_sr != sampling_rate:
+        waveform = torchaudio.functional.resample(waveform, orig_freq=orig_sr, new_freq=sampling_rate)    
+
+    return {'waveform': waveform, 'sampling_rate': sampling_rate}
+
+
+def load_as_hf_dataset(split_name, sampling_rate=DS_SR):
+    assert split_name in ['train', 'test'], "Invalid dataset split"
+    data = list(load_split(split_name).values())
+    dataset = Dataset.from_list(data)
+    dataset = dataset.map(lambda item: __load_item(item, sampling_rate), remove_columns=['segment', 'wav_path'])
+    dataset = dataset.with_format("torch")
+    return dataset
 
 
 if __name__ == '__main__':
