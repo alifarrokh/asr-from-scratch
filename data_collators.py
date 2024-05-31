@@ -19,7 +19,7 @@ class MelSpectrogramDataCollator:
 
         # Pad labels
         labels = [item['labels'] for item in items]
-        labels = pad_sequence(labels, batch_first=True)
+        labels = pad_sequence(labels, batch_first=True) # (batch_size, time)
 
         # Compute senquence & label lengths
         sequence_lengths = [item['mel_spectrogram'].shape[-1] for item in items]
