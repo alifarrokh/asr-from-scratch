@@ -2,9 +2,11 @@ from dataclasses import dataclass
 from typing import Optional
 import torch
 from torch import nn
+from evaluate import load as load_metric
 import lightning as L
 from utils import describe_model_size
 from load_dataset import CHAR_PAD, load_vocab
+import pyctcdecode
 
 
 class CNNLayer(nn.Module):
@@ -68,6 +70,9 @@ class DeepSpeech2Config:
 
     def n_vocab(self) -> int:
         return len(self.vocab)
+
+    def vocab_list(self) -> list[str]:
+        return [token for token, _i in sorted(self.vocab.items(), key=lambda item: item[1])]
 
     def blank_index(self) -> int:
         return self.vocab[self.blank_token]
@@ -146,15 +151,16 @@ class LightDeepSpeech2(L.LightningModule):
         batch = {k:v.to(self.device) for k,v in batch.items()}
         logits, sequence_lengths = self.asr_model(batch['features'], batch['sequence_lengths']) # (batch_size, time, n_vocab), (batch_size)
 
-        # Compute loss
         loss = None
+        metrics = None
         if 'labels' in batch:
             log_probs = nn.functional.log_softmax(logits, dim=-1).transpose(0, 1) # (time, batch_size, n_vocab)
             loss_fn = nn.CTCLoss(self.config.blank_index())
             loss = loss_fn(log_probs, batch['labels'], sequence_lengths, batch['label_lengths'])
 
-        # Compute metrics 
-        metrics = self.compute_metrics(logits) if with_metrics else None
+            # Compute metrics
+            if with_metrics:
+                metrics = self.compute_metrics(logits, batch['labels'])
 
         return ASROutput(logits=logits, loss=loss, metrics=metrics)
 
@@ -169,8 +175,21 @@ class LightDeepSpeech2(L.LightningModule):
         for metric_name, metric_value in asr_output.metrics.items():
             self.log(f"val_{metric_name}", metric_value, prog_bar=True)
 
-    def compute_metrics(self, logits: torch.Tensor):
-        return {'wer': 0, 'cer': 0}
+    def compute_metrics(self, logits: torch.Tensor, labels: torch.Tensor):
+        vocab_list = self.config.vocab_list()
+
+        # Decode labels
+        labels = labels.cpu().numpy()
+        labels = [''.join([vocab_list[t] for t in l if t != -100]) for l in labels]
+
+        # Decode predictions (Greedy decoding)
+        ctc_decoder = pyctcdecode.build_ctcdecoder(vocab_list)
+        batch_logits = logits.detach().cpu().numpy()
+        preds = [ctc_decoder.decode(logits, beam_width=1) for logits in batch_logits]
+
+        wer = load_metric("wer").compute(predictions=preds, references=labels)
+        cer = load_metric("cer").compute(predictions=preds, references=labels)
+        return {'wer': wer, 'cer': cer}
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.config.learning_rate)
