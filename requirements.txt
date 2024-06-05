@@ -9,3 +9,5 @@ librosa
 soundfile
 matplotlib
 pyctcdecode
+lightning
+tensorboard

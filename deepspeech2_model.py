@@ -4,9 +4,20 @@ import torch
 from torch import nn
 from evaluate import load as load_metric
 import lightning as L
-from utils import describe_model_size
-from load_dataset import CHAR_PAD, load_vocab
 import pyctcdecode
+from utils import describe_model_size
+from vocab import Vocab
+from tokenizer import Tokenizer
+
+
+@dataclass
+class DeepSpeech2Config:
+    n_mels: int # Number of mel filterbanks
+    hidden_units: int # Number of RNN hidden units
+    tokenizer: Tokenizer
+
+    # TODO -> Improve config classes
+    learning_rate: float = 1e-4
 
 
 class CNNLayer(nn.Module):
@@ -16,7 +27,7 @@ class CNNLayer(nn.Module):
         super(CNNLayer, self).__init__()
         self.cnn = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
         self.batch_norm = nn.BatchNorm2d(num_features=out_channels)
-        self.activation = nn.ReLU()
+        self.activation = nn.Hardtanh()
 
     def _calc_new_sequence_length(self, sequence_lengths: torch.IntTensor):
         """ Calculates output senquence lengths based on CNN receptive field. """
@@ -40,7 +51,7 @@ class RNNLayer(nn.Module):
 
     def __init__(self, in_features, hidden_units):
         super(RNNLayer, self).__init__()
-        self.rnn = nn.GRU(in_features, hidden_units, batch_first=True, bidirectional=True)
+        self.rnn = nn.LSTM(in_features, hidden_units, batch_first=True, bidirectional=True)
         self.layer_norm = nn.LayerNorm(2 * hidden_units)
 
     def forward(self, features, sequence_lengths: torch.IntTensor):
@@ -53,29 +64,6 @@ class RNNLayer(nn.Module):
 
         x = self.layer_norm(x) # (batch_size, time, 2 * hidden_units)
         return x
-
-
-@dataclass
-class DeepSpeech2Config:
-    """Deep Speech 2 Config"""
-
-    # Model-specifig parameters
-    vocab: dict[str, int]
-    blank_token: str
-    n_mels: int # Number of mel filterbanks
-    hidden_units: int # Number of RNN hidden units
-
-    # Hyper-parameters
-    learning_rate: float = 1e-4
-
-    def n_vocab(self) -> int:
-        return len(self.vocab)
-
-    def vocab_list(self) -> list[str]:
-        return [token for token, _i in sorted(self.vocab.items(), key=lambda item: item[1])]
-
-    def blank_index(self) -> int:
-        return self.vocab[self.blank_token]
 
 
 class DeepSpeech2(nn.Module):
@@ -104,9 +92,8 @@ class DeepSpeech2(nn.Module):
         # Classifier
         self.classifier = nn.Sequential(
             nn.Linear(2 * self.config.hidden_units, self.config.hidden_units),
-            nn.Dropout(p=0.2),
-            nn.ReLU(),
-            nn.Linear(self.config.hidden_units, self.config.n_vocab())
+            nn.Hardtanh(),
+            nn.Linear(self.config.hidden_units, len(self.config.tokenizer.vocab))
         )
 
     def forward(
@@ -114,7 +101,8 @@ class DeepSpeech2(nn.Module):
         features: torch.FloatTensor,
         sequence_lengths: torch.IntTensor # Sorted in decreasing order
     ) -> torch.FloatTensor:
-        x = features # (batch_size, 1, features, time)
+        x = features # (batch_size, features, time)
+        x = x.unsqueeze(1) # (batch_size, 1, features, time)
 
         # Apply CNN layers
         for cnn_layer in self.cnn_layers:
@@ -132,21 +120,24 @@ class DeepSpeech2(nn.Module):
 
 
 @dataclass
-class ASROutput:
+class DeepSpeechOutput:
     logits: Optional[torch.Tensor] = None
     loss: Optional[torch.Tensor] = None
     metrics: Optional[dict[str, float]] = None
 
 
 class LightDeepSpeech2(L.LightningModule):
-    """A Lightning Wrapper Over ASR Models"""
+    """A Lightning Wrapper Over Deep Speech 2"""
 
     def __init__(self, config: DeepSpeech2Config):
         super().__init__()
+        self.save_hyperparameters()
         self.config = config
         self.asr_model = DeepSpeech2(config)
+        self.wer_metric = load_metric("wer")
+        self.cer_metric = load_metric("cer")
 
-    def forward(self, batch: dict[str, torch.Tensor], with_metrics: bool = False) -> ASROutput:
+    def forward(self, batch: dict[str, torch.Tensor], with_metrics: bool = False) -> DeepSpeechOutput:
         # Forward pass
         batch = {k:v.to(self.device) for k,v in batch.items()}
         logits, sequence_lengths = self.asr_model(batch['features'], batch['sequence_lengths']) # (batch_size, time, n_vocab), (batch_size)
@@ -155,14 +146,14 @@ class LightDeepSpeech2(L.LightningModule):
         metrics = None
         if 'labels' in batch:
             log_probs = nn.functional.log_softmax(logits, dim=-1).transpose(0, 1) # (time, batch_size, n_vocab)
-            loss_fn = nn.CTCLoss(self.config.blank_index())
+            loss_fn = nn.CTCLoss(self.config.tokenizer.vocab.blank_idx(), zero_infinity=True)
             loss = loss_fn(log_probs, batch['labels'], sequence_lengths, batch['label_lengths'])
 
             # Compute metrics
             if with_metrics:
                 metrics = self.compute_metrics(logits, batch['labels'])
 
-        return ASROutput(logits=logits, loss=loss, metrics=metrics)
+        return DeepSpeechOutput(logits=logits, loss=loss, metrics=metrics)
 
     def training_step(self, batch: dict[str, torch.Tensor], _batch_idx):
         asr_output = self.forward(batch)
@@ -176,35 +167,35 @@ class LightDeepSpeech2(L.LightningModule):
             self.log(f"val_{metric_name}", metric_value, prog_bar=True)
 
     def compute_metrics(self, logits: torch.Tensor, labels: torch.Tensor):
-        vocab_list = self.config.vocab_list()
-
         # Decode labels
         labels = labels.cpu().numpy()
-        labels = [''.join([vocab_list[t] for t in l if t != -100]) for l in labels]
+        labels = self.config.tokenizer.decode(labels)
 
         # Decode predictions (Greedy decoding)
+        vocab_list = self.config.tokenizer.vocab.idx_to_char
         ctc_decoder = pyctcdecode.build_ctcdecoder(vocab_list)
         batch_logits = logits.detach().cpu().numpy()
         preds = [ctc_decoder.decode(logits, beam_width=1) for logits in batch_logits]
 
-        wer = load_metric("wer").compute(predictions=preds, references=labels)
-        cer = load_metric("cer").compute(predictions=preds, references=labels)
-        return {'wer': wer, 'cer': cer}
+        return {
+            'wer': self.wer_metric.compute(predictions=preds, references=labels),
+            'cer': self.cer_metric.compute(predictions=preds, references=labels)
+        }
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.config.learning_rate)
         lr_scheduler = {
-            'scheduler': torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
+            'scheduler': torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.98)
         }
         return [optimizer], [lr_scheduler]
 
 
 if __name__ == '__main__':
-    vocab = load_vocab()
+    vocab = Vocab.from_json('deepspeech2_vocab.json')
+    tokenizer = Tokenizer(vocab)
     config = DeepSpeech2Config(
-        vocab=vocab,
-        blank_token=CHAR_PAD,
         n_mels=80,
-        hidden_units=512,
+        hidden_units=384,
+        tokenizer=tokenizer,
     )
     describe_model_size(DeepSpeech2(config))

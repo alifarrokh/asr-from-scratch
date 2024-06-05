@@ -8,13 +8,7 @@ from datasets import Dataset
 from utils import proper_n_bins
 
 
-# Special chars
-CHAR_SPACE = ' '
-CHAR_PAD = '[PAD]'
-CHAR_UNK = '[UNK]'
-
-# Dataset address
-DEFAULT_VOCAB_PATH = 'vocab.json'
+# Dataset Config
 CACHE_DIR = 'cache'
 DS_ROOT = 'dataset'
 WAVS_DIR = f'{DS_ROOT}/wav'
@@ -25,6 +19,7 @@ os.system(f'mkdir -p {CACHE_DIR}')
 
 
 def read_lines(file_path):
+    """Return the list of lines in the given file"""
     return [l.strip() for l in open(file_path) if l.strip() != '']
 
 
@@ -58,7 +53,8 @@ def preprocess_text(s):
     return s
 
 
-def load_split(split_name, duration_threshold=60):
+def load_split(split_name, max_duration: int = 22):
+    """Load a dataset subset"""
     assert split_name in ['train', 'test'], "Invalid dataset split"
 
     segments_path = f'{DS_ROOT}/{split_name}/segments'
@@ -76,24 +72,24 @@ def load_split(split_name, duration_threshold=60):
     } for k in labels.keys()}
 
     # Filter long audio segments
-    if duration_threshold:
+    if max_duration:
         duration = lambda item: item['segment'][1] - item['segment'][0]
-        data = {k:v for k,v in data.items() if duration(v) < duration_threshold}
+        data = {k:v for k,v in data.items() if duration(v) < max_duration}
 
     return data
 
 
-def plot_duration_histograms():
+def plot_duration_histograms(max_duration: int):
     """Plot the duration histogram of the dataset"""
     # Find train and test durations
-    train_data = list(load_split('train').values())
-    test_data = list(load_split('test').values())
+    train_data = list(load_split('train', max_duration=10000).values())
+    test_data = list(load_split('test', max_duration=10000).values())
     train_durations = np.array([item['segment'][1] - item['segment'][0] for item in train_data])
     test_durations = np.array([item['segment'][1] - item['segment'][0] for item in test_data])
 
-    print('Share of items shorter than 60 seconds:')
-    print(f'Train: {(train_durations < 60).sum() / len(train_durations)}')  # 0.9927385892116183
-    print(f'Test: {(test_durations < 60).sum() / len(test_durations)}')     # 0.9847953216374269
+    print(f'Share of items shorter than {max_duration} seconds:')
+    print(f'Train: {(train_durations < max_duration).sum() / len(train_durations)}')
+    print(f'Test: {(test_durations < max_duration).sum() / len(test_durations)}')
 
     # Plot histograms
     train_bins = proper_n_bins(train_durations)
@@ -107,36 +103,15 @@ def plot_duration_histograms():
     plt.savefig('DurationHistogram.png')
 
 
-def generate_vocab(with_special_tokens=True, vocab_path=DEFAULT_VOCAB_PATH):
-    """Extract the vocab and save it as a json file"""
+def get_alphabet():
+    """Extract the vocabulary from the dataset"""
     train_data = load_split('train')
     test_data = load_split('test')
     all_data = train_data | test_data
     labels = [item['sentence'] for item in all_data.values()]
     all_chars = list(set(' '.join(labels)))
     all_chars = sorted(all_chars, key=ord)
-    vocab_dict = {v: k for k, v in enumerate(all_chars)}
-
-    # Space
-    if CHAR_SPACE != ' ':
-        vocab_dict[CHAR_SPACE] = vocab_dict[" "]
-        del vocab_dict[" "]
-
-    # Special tokens
-    if with_special_tokens:
-        vocab_dict[CHAR_UNK] = len(vocab_dict)
-        vocab_dict[CHAR_PAD] = len(vocab_dict)
-
-    # Save the vocab
-    with open(vocab_path, 'w') as vocab_file:
-        json.dump(vocab_dict, vocab_file)
-
-
-def load_vocab(vocab_path=DEFAULT_VOCAB_PATH):
-    """Load the vocab from a json file"""
-    with open(vocab_path) as f:
-        vocab = json.load(f)
-    return vocab
+    return all_chars
 
 
 def load_item(item):
@@ -161,7 +136,7 @@ def extract_features(item):
     mel_extractor = torchaudio.transforms.MelSpectrogram(
         sample_rate=item['sampling_rate'],
         n_fft=400, # 25 ms for 16K hz audio
-        hop_length=200, # 50% overlap
+        hop_length=160, # 10 ms stride
         f_min=0,
         f_max=item['sampling_rate'] // 2,
         n_mels=80
@@ -169,24 +144,18 @@ def extract_features(item):
     return {'mel_spectrogram': mel_extractor(item['waveform'])}
 
 
-def tokenize_sentence(item, vocab):
-    """Tokenize the given sentence"""
-    tokens = [vocab[c] for c in item['sentence']]
-    return {'labels': tokens}
-
-
 def load_hf_dataset(
     split_name: str,
     sampling_rate: int = DS_SR,
     with_features: bool = False,
-    tokenize_with_vocab: dict = None,
+    max_duration: int = 22,
     limit: int = None, # Max number of returned items (for testing purposes)
 ) -> Dataset:
     """Load the dataset as a Hugging Face dataset"""
     assert split_name in ['train', 'test'], "Invalid dataset split"
 
     # Load metadata
-    data = list(load_split(split_name).values())
+    data = list(load_split(split_name, max_duration).values())
     data = [item | {'target_sampling_rate': sampling_rate} for item in data]
     if limit:
         data = data[:limit]
@@ -198,7 +167,7 @@ def load_hf_dataset(
         load_item,
         remove_columns=['segment', 'wav_path', 'target_sampling_rate'],
         keep_in_memory=False,
-        cache_file_name=os.path.join(CACHE_DIR, f'{split_name}{limit_str}_raw')
+        cache_file_name=os.path.join(CACHE_DIR, f'{split_name}{limit_str}_raw_{max_duration}s')
     )
     dataset = dataset.with_format("torch")
 
@@ -209,16 +178,19 @@ def load_hf_dataset(
             remove_columns=['sampling_rate', 'waveform'],
         )
 
-    # Tokenize the labels
-    if tokenize_with_vocab:
-        dataset = dataset.map(
-            lambda item: tokenize_sentence(item, tokenize_with_vocab),
-            remove_columns=['sentence'],
-        )
-
     return dataset
 
 
+def extract_train_sentences():
+    """
+    Save the list of training sentences (required for training a language model)
+    """
+    train_data = list(load_split('train', max_duration=1000).values())
+    with open('train_sentences.txt', 'w') as out:
+        for item in train_data:
+            out.write(item['sentence'] + '\n')
+
+
 if __name__ == '__main__':
-    generate_vocab()
-    plot_duration_histograms()
+    plot_duration_histograms(max_duration=22)
+    extract_train_sentences()

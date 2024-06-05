@@ -1,4 +1,34 @@
 import numpy as np
+import torch
+
+
+CONSTANT = 1e-5
+
+
+def normalize_mels(x: torch.FloatTensor, sequence_lengths: torch.IntTensor):
+    """
+    Normalize a batch of mel spectrograms x with the shape (batch_size, n_mels, time)
+    Source: https://github.com/NVIDIA/NeMo/blob/main/nemo/collections/asr/parts/preprocessing/features.py
+    """
+    batch_size = x.shape[0]
+    max_time = x.shape[2]
+
+    time_steps = torch.arange(max_time, device=x.device).unsqueeze(0).expand(batch_size, max_time)
+    valid_mask = time_steps < sequence_lengths.unsqueeze(1)
+    x_mean_numerator = torch.where(valid_mask.unsqueeze(1), x, 0.0).sum(axis=2)
+    x_mean_denominator = valid_mask.sum(axis=1)
+    x_mean = x_mean_numerator / x_mean_denominator.unsqueeze(1)
+
+    # Subtract 1 in the denominator to correct for the bias.
+    x_std = torch.sqrt(
+        torch.sum(torch.where(valid_mask.unsqueeze(1), x - x_mean.unsqueeze(2), 0.0) ** 2, axis=2)
+        / (x_mean_denominator.unsqueeze(1) - 1.0)
+    )
+
+    # make sure x_std is not zero
+    x_std += CONSTANT
+
+    return (x - x_mean.unsqueeze(2)) / x_std.unsqueeze(2)
 
 
 def proper_n_bins(x):
